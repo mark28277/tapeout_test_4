@@ -15,7 +15,7 @@ module tt_um_mark28277 (
 
     // Input interface for Tiny Tapeout limited I/O
     wire reset;
-    assign reset = rst_n; // Active low reset (rst_n=0 means reset)
+    assign reset = ~rst_n; // Convert active-low to active-high reset
 
     // Neural network input (8-bit for Tiny Tapeout)
     wire [7:0] input_data;
