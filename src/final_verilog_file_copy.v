@@ -99,6 +99,7 @@ module conv2d_layer (
     reg [31:0] weights [0:1][0:2][0:2][0:2]; // 2x3x3x3 weights
     reg [31:0] biases [0:1]; // 2 biases
 
+
     // Weight initialization from trained model
     initial begin
         weights[0][0][0][0] = 32'h0000ff77;
