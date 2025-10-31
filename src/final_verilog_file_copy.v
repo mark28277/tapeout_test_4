@@ -12,22 +12,36 @@ module tt_um_mark28277 (
     input wire           clk, //(clock)
     input wire           rst_n //(reset_n - low to reset)
 );
+    //-----------------------load image---------------------------
+    reg [7:0] image_buffer [63:0];  // Store 64 pixels, based on input data
+    reg [5:0] pixel_counter;      // Count 0-63
+    wire loading_done = (pixel_couter == 63);
+
+    always @(posedge clk) begin
+        if (reset) begin
+            pixel_counter <= 0;
+        end else begin
+            image_buffer[pixel_counter] <= ui_in;  // Store current pixel
+            if (pixel_counter < 63) begin
+                pixel_counter <= pixel_counter + 1;
+            end
+        end
+    end
 
     // Input interface for Tiny Tapeout limited I/O
     wire reset;
     assign reset = ~rst_n;
 
-    // Neural network input (8-bit for Tiny Tapeout)
-    wire [7:0] input_data;
-    assign input_data = ui_in; // Use dedicated input directly
-
     // Conv2d Layer 0
-    wire [7:0] conv_0_out;
+    wire [7:0] conv_0_out_0;
+    wire [7:0] conv_0_out_1; //based on # filters
     conv2d_layer conv_inst_0 (
         .clk(clk),
         .reset(reset),
-        .input_data(input_data),
-        .output_data(conv_0_out)
+        .input_data(image_buffer),
+        .start_processing(loading_done),
+        .output_data_0(conv_0_out_0)
+        .output_data_1(conv_0_out_1)
     );
 
     // ReLU Layer 1
@@ -87,29 +101,150 @@ module tt_um_mark28277 (
 
 endmodule
 
-// Simplified Conv2d Layer for Tiny Tapeout
+//-------------conv2d module--------------------------------
 module conv2d_layer (
     input wire clk,
     input wire reset,
-    input wire [7:0] input_data,
-    output wire [7:0] output_data
+    input wire start_processing,
+    input wire [7:0] input_data [63:0],
+    output reg [7:0] output_data_0, //output wire numbers based on # filters
+    output reg [7:0] output_data_1
 );
 
-    // Simplified convolution for Tiny Tapeout
-    reg [7:0] output_reg;
-
-    always @(posedge clk) begin
-        if (reset) begin
-            output_reg <= 8'b0;
-        end else begin
-            // Simplified convolution operation
-            output_reg <= input_data + 8'h10;
-        end
+    //weights and biases (from weight loader)
+    reg signed [7:0] conv_weight [17:0];
+    initial begin
+        conv_weight[0] = 11;
+        conv_weight[1] = 8;
+        conv_weight[2] = 16;
+        conv_weight[3] = 9;
+        conv_weight[4] = 9;
+        conv_weight[5] = 14;
+        conv_weight[6] = -16;
+        conv_weight[7] = -12;
+        conv_weight[8] = 11;
+        conv_weight[9] = -11;
+        conv_weight[10] = -4;
+        conv_weight[11] = 4;
+        conv_weight[12] = -9;
+        conv_weight[13] = -16;
+        conv_weight[14] = 7;
+        conv_weight[15] = -7;
+        conv_weight[16] = -1;
+        conv_weight[17] = 10;
     end
 
-    assign output_data = output_reg;
+    reg signed [7:0] conv_bias [1:0];
+    initial begin
+        conv_bias[0] = 3;
+        conv_bias[1] = 13;
+    end
 
+
+
+    //-----------------convolution steps: ----------------------------
+    reg processing;
+    reg [5:0] pos_counter;    // 0-35
+    reg [4:0] weight_counter; // 0-18
+
+    // For window centered at (center_x, center_y), each pixel 0-8
+    wire signed [2:0] center_x = pos_counter % 6;
+    wire signed [2:0] center_y = pos_counter / 6;
+    reg [7:0] input_buffer [8:0];
+
+    function [7:0] get_pixel;
+        input signed [4:0] x, y;  // Signed coordinates (-8 to 7)
+        begin
+            if (x < 0 || x > 7 || y < 0 || y > 7)
+                get_pixel = 0;  // Zero-padding for edges
+            else
+                get_pixel = input_data[y * 8 + x];
+        end
+    endfunction
+
+    always @(*) begin
+        if (processing) begin
+            input_buffer[0] = get_pixel((center_x-1), (center_y-1)); // Top-left
+            input_buffer[1] = get_pixel(center_x, (center_y-1));     // Top-middle
+            input_buffer[2] = get_pixel((center_x+1), (center_y-1)); // Top-right
+            input_buffer[3] = get_pixel((center_x-1), center_y);     // Middle-left  
+            input_buffer[4] = get_pixel(center_x, center_y);         // Center
+            input_buffer[5] = get_pixel((center_x+1), center_y);     // Middle-right
+            input_buffer[6] = get_pixel((center_x-1), (center_y+1)); // Bottom-left
+            input_buffer[7] = get_pixel(center_x, (center_y+1));     // Bottom-middle
+            input_buffer[8] = get_pixel((center_x+1), (center_y+1)); // Bottom-right
+        end
+    end
+    
+    
+    //------------convolution: output of each convolution = Σ(pixel*weight)+bias-------------------
+    reg [18:0] accum_0;  // Filter 0
+    reg [18:0] accum_1;  // Filter 1
+    reg [3:0] kernel_position;
+    reg [7:0] pixel_val;
+
+    // Scaling + ReLU function
+    function [7:0] scale_and_relu;
+        input [18:0] value;
+        begin
+            if (value[18]) begin
+                // Negative → ReLU to 0
+                scale_and_relu = 8'b0;
+            end else if (value[18:11] != 8'b0) begin
+                // Overflow → saturate to 255
+                scale_and_relu = 8'hFF;
+            end else begin
+                // Normal case: scale 19-bit → 8-bit
+                scale_and_relu = value[10:3];
+            end
+        end
+    endfunction
+
+    always @(posedge clk) 
+    begin
+        if (reset) begin
+            // Reset everything
+            weight_counter <= 0;
+            accum_0 <= 0;
+            accum_1 <= 0;
+            output_data_0 <= 0;
+            output_data_1 <= 0;
+            pos_counter <= 0;
+            processing <= 0;
+        end else if (start_processing && !processing) begin
+            // Start processing after image loaded
+            processing <= 1;
+        end else if (processing) begin
+            // INNER LOOP: Process weights for current position
+            kernel_position = weight_counter % 9;
+            pixel_val = input_buffer[kernel_position];
+            if(weight_counter < 9) begin                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
+                accum_0 <= accum_0 + (pixel_val * conv_weight[weight_counter]);
+            end else begin
+                accum_1 <= accum_1 + (pixel_val * conv_weight[weight_counter]);
+                if (weight_counter == 18) //based on # weights
+                begin
+                    output_data_0 <= scale_and_relu(accum_0 + (conv_bias[0] << 11));
+                    output_data_1 <= scale_and_relu(accum_1 + (conv_bias[1] << 11));
+                end
+            end
+            weight_counter <= weight_counter + 1;
+
+            // Reset when done with all weights
+            if (weight_counter == 18) begin
+                weight_counter <= 0;
+                accum_0 <= 0;  // Reset accumulators for next position
+                accum_1 <= 0;
+                pos_counter <= pos_counter + 1; //move to nest position
+            end
+
+            if (pos_counter == 35) begin
+                processing <= 0;  // All done!
+            end
+        end
+    end
 endmodule
+//--------------------------------------------------------------------------------------------------------------
 
 // Simplified Linear Layer for Tiny Tapeout
 module linear_layer (
